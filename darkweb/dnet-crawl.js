@@ -1,11 +1,12 @@
 // /darkweb/dnet-crawl.js — darknet resident agent
-// Spreads across the darknet, cracks servers (simple models inline, hard via
-// dnet-crack.js), records topology, maintains cache/RAM via dnet-ops.js.
-// ALL ns.dnet.* calls routed through rd() temp scripts.
-// In-game RAM: ~3-4 GB.
+// Spreads across the darknet, cracks servers (simple models inline via direct
+// ns.dnet.* calls, hard models via dnet-crack.js).
+// Hot path (probe / getServerDetails / authenticate) is direct — no rd() overhead.
+// rd() is kept only for low-frequency operations (storm, stasis, backdoor).
+// In-game RAM: ~5.6 GB.
 //
 // Usage:
-//   run /darkweb/dnet-crawl.js [--tail] [--loop 30000] [--maint-ms 120000]
+//   run /darkweb/dnet-crawl.js [--tail] [--idle-ms 2000] [--maint-ms 120000]
 //   run /darkweb/dnet-crawl.js --no-maint --no-spread --tail
 
 /** @param {NS} ns */
@@ -28,7 +29,9 @@ export async function main(ns) {
   const KILL_PREFIX = "DNET_KILL|";
   const CMD_PREFIX  = "DNET_CMD|";
 
-  const LOOP_MS       = getFlagNumber(ns, ["--loop"],     30_000);
+  // IDLE_MS: sleep between cycles only when no new neighbors were processed.
+  // When there is work to do the loop runs immediately with no sleep.
+  const IDLE_MS       = getFlagNumber(ns, ["--idle-ms", "--loop"], 2_000);
   const MAINT_MS      = getFlagNumber(ns, ["--maint-ms"], 120_000);
   const RD_TIMEOUT_MS = getFlagNumber(ns, ["--rd-timeout"], 8_000);
   const MAX_SPREAD    = getFlagNumber(ns, ["--max-spread"], 200);
@@ -48,12 +51,11 @@ export async function main(ns) {
     return;
   }
 
-  ns.print(`[DNET-CRAWL] Started on ${HOST} loop=${LOOP_MS}ms maint=${MAINT_MS}ms`);
+  ns.print(`[DNET-CRAWL] Started on ${HOST} idle=${IDLE_MS}ms maint=${MAINT_MS}ms`);
 
   let lastMaint = 0;
   let spreadCount = 0;
   const crackedThisSession = new Set();
-  const failedThisSession  = new Set();
   const sentToCracker      = new Set();
 
   // Initial maintenance before main loop
@@ -65,8 +67,9 @@ export async function main(ns) {
     lastMaint = Date.now();
   }
 
-  // Main loop
+  // Main loop — runs continuously; only sleeps when there is nothing new to do.
   while (true) {
+    let didAnything = false;
     try {
       if (shouldDie()) {
         ns.print(`[DNET-CRAWL] Kill signal received on port ${KILL_PORT}. Exiting.`);
@@ -75,73 +78,68 @@ export async function main(ns) {
 
       await handleCommandBus();
 
-      // Probe neighbors
-      const neighbors = await rd("probe", `ns.dnet.probe()`, []) ?? [];
+      // Probe neighbors directly — no rd() overhead.
+      let neighbors = [];
+      try { neighbors = await ns.dnet.probe() ?? []; } catch (_) {}
+
       if (neighbors.length === 0) {
-        ns.print(`[DNET-CRAWL] No neighbors found; sleeping ${LOOP_MS}ms`);
-        await ns.sleep(LOOP_MS);
+        await ns.sleep(IDLE_MS);
         continue;
       }
 
-      // Batch-fetch server details
-      const detailsMap = await batchDetails(neighbors);
-
-      // Process each neighbor
+      // Process each neighbor immediately.
       for (const target of neighbors) {
         if (shouldDie()) break;
         if (crackedThisSession.has(target)) continue;
 
-        const det = detailsMap[target];
-        if (!det) continue;
+        // Get details directly — no rd() overhead.
+        let det;
+        try { det = await ns.dnet.getServerDetails(target); } catch (_) { continue; }
+        if (!det || !det.isOnline) continue;
 
-        // Already have a session — just spread if not yet done
+        didAnything = true;
+
+        // Active session — spread immediately.
         if (det.hasSession) {
           crackedThisSession.add(target);
           if (!NO_SPREAD) await spreadTo(target, "");
           continue;
         }
 
-        // Check ledger first — reconnect if we know the password
+        // Check ledger — reconnect with known password.
         const ledger = readLedger();
         const rec = ledger.get(target);
         if (rec?.password !== undefined) {
-          const ok = await rdConnect(target, rec.password);
-          if (ok?.success || ok?.session) {
+          const pw = await tryPw(target, rec.password);
+          if (pw !== null) {
             ns.print(`[DNET-CRAWL] Reconnected ${target} via ledger`);
             crackedThisSession.add(target);
-            if (!NO_SPREAD) await spreadTo(target, rec.password);
-            continue;
-          }
-        }
-
-        if (failedThisSession.has(target)) continue;
-
-        const model = det.modelId ?? det.model ?? "?";
-        const pw = NO_SIMPLE ? null : await tryCrackSimple(target, det, model);
-
-        if (pw !== null && pw !== undefined) {
-          const session = await rdConnect(target, pw);
-          if (session?.success || session?.session) {
-            ns.print(`[DNET-CRAWL] [CRACKED] ${target} model=${model} pw="${pw}"`);
-            crackedThisSession.add(target);
-            await recordPassword(target, pw, model);
             if (!NO_SPREAD) await spreadTo(target, pw);
             continue;
           }
         }
 
-        // Delegate to dnet-crack.js for hard models
-        if (!sentToCracker.has(target)) {
-          const modelId = det.modelId ?? "";
-          if (!isSimpleModel(modelId)) {
-            await sendToCracker(target);
-            sentToCracker.add(target);
-          }
+        const model = det.modelId ?? det.model ?? "?";
+        const pw = NO_SIMPLE ? null : await tryCrackSimple(target, det, model);
+
+        if (pw !== null && pw !== undefined) {
+          // authenticate() already confirmed the password; go straight to spread.
+          ns.print(`[DNET-CRAWL] [CRACKED] ${target} model=${model} pw="${pw}"`);
+          crackedThisSession.add(target);
+          await recordPassword(target, pw, model);
+          if (!NO_SPREAD) await spreadTo(target, pw);
+          continue;
+        }
+
+        // Delegate hard models (and unhandled simple variants) to dnet-crack.js.
+        if (!sentToCracker.has(target) && !isHandledInline(model, det)) {
+          await sendToCracker(target);
+          sentToCracker.add(target);
         }
       }
 
       // Record topology
-      updateMap(neighbors, detailsMap);
+      updateMap(neighbors);
       if (COPY_HOME && HOST !== HOME) {
         try { await ns.scp(MAP_FILE, HOME, HOST); } catch (_) {}
       }
@@ -158,10 +156,11 @@ export async function main(ns) {
       ns.print(`[DNET-CRAWL] Loop error (will retry): ${e}`);
     }
 
-    await ns.sleep(LOOP_MS);
+    // Only sleep when there was nothing new this cycle.
+    if (!didAnything) await ns.sleep(IDLE_MS);
   }
 
-  // ── rd() RAM-dodge engine ───────────────────────────────────────────────────
+  // ── rd() RAM-dodge engine (used only for infrequent operations) ─────────────
 
   async function rd(label, expr, args = [], timeoutMs = RD_TIMEOUT_MS) {
     const token = `${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
@@ -212,30 +211,9 @@ export async function main(ns) {
     } catch (e) { ns.print(`[RD] parse error ${safeLabel}: ${raw.slice(0, 100)}`); return null; }
   }
 
-  // ── dnet API helpers ────────────────────────────────────────────────────────
+  // ── Low-frequency rd() wrappers (storm / stasis / backdoor) ─────────────────
 
-  async function batchDetails(hosts) {
-    if (!hosts.length) return {};
-    const expr = `(async()=>{
-      const out={};
-      for(const h of args){
-        try{ out[h]=await ns.dnet.getServerDetails(h); }catch(_){ out[h]=null; }
-      }
-      return out;
-    })()`;
-    const result = await rd("details", expr, hosts, RD_TIMEOUT_MS * hosts.length);
-    return result ?? {};
-  }
-
-  async function rdAuth(target, pw) {
-    return rd("auth", `ns.dnet.authenticate(args[0],args[1])`, [target, pw]);
-  }
-
-  async function rdConnect(target, pw) {
-    return rd("session", `ns.dnet.connectToSession(args[0],args[1])`, [target, pw]);
-  }
-
-  async function rdStorm(target) {
+  async function rdStorm() {
     return rd("storm", `ns.dnet.unleashStormSeed()`, []);
   }
 
@@ -247,42 +225,27 @@ export async function main(ns) {
     return rd("backdoor", `ns.dnet.backdoor(args[0])`, [target], 30_000);
   }
 
-  // ── Simple inline crackers ──────────────────────────────────────────────────
+  // ── Simple inline crackers (direct ns.dnet.authenticate calls) ──────────────
 
-  const DEFAULTS         = ["admin","password","0000","12345"];
-  const DOGS             = ["fido","spot","rover","max"];
-  const EU_COUNTRIES     = [
-    "Austria","Belgium","Bulgaria","Croatia","Republic of Cyprus","Czech Republic",
-    "Denmark","Estonia","Finland","France","Germany","Greece","Hungary","Ireland",
-    "Italy","Latvia","Lithuania","Luxembourg","Malta","Netherlands","Poland",
-    "Portugal","Romania","Slovakia","Slovenia","Spain","Sweden",
-  ];
-  const COMMON_PASSWORDS = [
-    "123456","password","123456789","12345678","12345","1234567","1234567890",
-    "qwerty","abc123","111111","123123","admin","letmein","welcome","monkey",
-    "dragon","master","shadow","qwerty123","1q2w3e4r","sunshine","princess",
-    "solo","1234","iloveyou","654321","superman","batman","trustno1","hello",
-    "freedom","michael","jessica","jesus","password1","ninja","mustang",
-    "access","test","baseball","soccer","hockey","dallas","yankees","robert",
-    "thomas","jordan","harley","ranger","daniel","andrew","andrea","joshua",
-    "george","hunter","buster","cookie","charlie","samantha","jessica","fuckyou",
-    "pepper","cheese","butter","summer","winter","spring","football","baseball",
-    "ginger","bailey","flower","rabbit","soccer","hockey","golfer","player",
-    "pass","asdf","zxcvbn","qwertyuiop","azerty","qweasdzxc","1qaz2wsx",
-    "abcdef","aaaaaa","000000","696969","123321","222222","999999","888888",
-    "7777777","1111111",
-  ];
+  const DEFAULTS = ["admin","password","0000","12345"];
+  const DOGS     = ["fido","spot","rover","max"];
 
-  function isSimpleModel(modelId) {
-    return [
-      "ZeroLogon","NoPassword",
-      "DeskMemo_3.1","EchoVuln",
-      "FreshInstall_1.0","DefaultPassword",
-      "CloudBlare(tm)","Captcha",
-      "Laika4","DogNames",
-      "BellaCuore","RomanNumeral",
-      "Pr0verFl0","BufferOverflow",
-    ].includes(modelId);
+  // Returns true when the model is fully handled inline for ALL difficulty ranges.
+  // BellaCuore/RomanNumeral at diff>=8 fall through to dnet-crack.js.
+  function isHandledInline(model, det) {
+    switch (model) {
+      case "ZeroLogon": case "NoPassword":
+      case "DeskMemo_3.1": case "EchoVuln":
+      case "FreshInstall_1.0": case "DefaultPassword":
+      case "CloudBlare(tm)": case "Captcha":
+      case "Laika4": case "DogNames":
+      case "Pr0verFl0": case "BufferOverflow":
+        return true;
+      case "BellaCuore": case "RomanNumeral":
+        return (det.difficulty ?? 99) < 8;
+      default:
+        return false;
+    }
   }
 
   async function tryCrackSimple(target, det, model) {
@@ -304,7 +267,7 @@ export async function main(ns) {
 
       case "BellaCuore": case "RomanNumeral":
         if ((det.difficulty ?? 99) < 8) return await crackRomanSimple(target, det);
-        return null; // complex range case → delegate to dnet-crack.js
+        return null; // diff>=8 range variant → dnet-crack.js
 
       case "Pr0verFl0": case "BufferOverflow":
         return await crackBufferOverflow(target, det);
@@ -314,16 +277,19 @@ export async function main(ns) {
     }
   }
 
+  // Direct authenticate — no rd() overhead. Returns pw on success, null on fail.
   async function tryPw(target, pw) {
-    const r = await rdAuth(target, pw);
-    if (r?.success) return pw;
+    try {
+      const r = await ns.dnet.authenticate(target, pw);
+      if (r?.success) return pw;
+    } catch (_) {}
     return null;
   }
 
   async function tryCandidates(target, list) {
     for (const pw of list) {
-      const r = await rdAuth(target, pw);
-      if (r?.success) return pw;
+      const r = await tryPw(target, pw);
+      if (r !== null) return r;
     }
     return null;
   }
@@ -343,7 +309,6 @@ export async function main(ns) {
   }
 
   async function crackRomanSimple(target, det) {
-    // diff < 8: single Roman numeral → parse to int
     const raw = String(det.data ?? det.passwordHint ?? "");
     const romanMatch = raw.match(/([IVXLCDM]+)/i);
     if (!romanMatch) return null;
@@ -354,8 +319,7 @@ export async function main(ns) {
 
   async function crackBufferOverflow(target, det) {
     const passLen = det.passwordLength ?? 4;
-    const exploit = "A".repeat(passLen * 2);
-    return await tryPw(target, exploit);
+    return await tryPw(target, "A".repeat(passLen * 2));
   }
 
   function parseRoman(s) {
@@ -381,7 +345,6 @@ export async function main(ns) {
     if (Date.now() > expiresAt) return;
 
     const target = decodeURIComponent(encodedTarget);
-
     ns.print(`[DNET-CRAWL] CMD id=${id} action=${action} target="${target}"`);
 
     switch (action) {
@@ -412,8 +375,9 @@ export async function main(ns) {
         break;
       }
       case "backdoor-all": {
-        const neighbors = await rd("probe", `ns.dnet.probe()`, []) ?? [];
-        for (const h of neighbors) {
+        let nbrs = [];
+        try { nbrs = await ns.dnet.probe() ?? []; } catch (_) {}
+        for (const h of nbrs) {
           const r = await rdBackdoor(h);
           ns.print(`[DNET-CRAWL] backdoor(${h}): ${JSON.stringify(r)}`);
         }
@@ -428,14 +392,11 @@ export async function main(ns) {
     if (NO_SPREAD || spreadCount >= MAX_SPREAD) return;
     if (target === HOST || target === HOME) return;
 
-    // Establish session from THIS script's PID so scp/exec succeed.
-    // connectToSession is called directly (not via rd()) so the session is
-    // registered under our PID, not a temp script's PID.
+    // connectToSession must be called directly from this PID so scp/exec succeed.
     if (pw !== undefined && pw !== null) {
       try { await ns.dnet.connectToSession(target, String(pw)); } catch (_) {}
     }
 
-    // Files to copy
     const files = [
       SELF,
       path("dnet-crack.js"),
@@ -455,7 +416,7 @@ export async function main(ns) {
 
     try {
       const pid = ns.exec(SELF, target, { preventDuplicates: true },
-        "--loop", LOOP_MS, "--maint-ms", MAINT_MS, "--rd-timeout", RD_TIMEOUT_MS);
+        "--idle-ms", IDLE_MS, "--maint-ms", MAINT_MS, "--rd-timeout", RD_TIMEOUT_MS);
       if (pid) {
         ns.print(`[DNET-CRAWL] Spread to ${target} pid=${pid}`);
         spreadCount++;
@@ -476,9 +437,9 @@ export async function main(ns) {
     }
   }
 
-  // ── Topology map ────────────────────────────────────────────────────────────
+  // ── Topology map ─────────────────────────────────────────────────────────────
 
-  function updateMap(neighbors, detailsMap) {
+  function updateMap(neighbors) {
     try {
       const existing = new Map();
       try {
@@ -492,10 +453,8 @@ export async function main(ns) {
 
       const ts = Date.now();
       for (const h of neighbors) {
-        const det = detailsMap[h];
-        const ip = det?.ip ?? "";
         const neighborList = neighbors.filter(n => n !== h).join(",");
-        existing.set(h, `${encodeURIComponent(h)}|${encodeURIComponent(ip)}|${ts}|${encodeURIComponent(neighborList)}`);
+        existing.set(h, `${encodeURIComponent(h)}|${ts}|${encodeURIComponent(neighborList)}`);
       }
 
       const rows = [...existing.values()].sort();
@@ -577,7 +536,7 @@ function getFlagNumber(ns, names, fallback = 0) {
 
 export function autocomplete() {
   return [
-    "--tail", "--loop", "--maint-ms", "--rd-timeout", "--max-spread",
+    "--tail", "--idle-ms", "--loop", "--maint-ms", "--rd-timeout", "--max-spread",
     "--no-maint", "--no-spread", "--no-simple", "--copy-home",
     "--kill-port", "--cmd-port", "--keep-rd", "--doctor",
   ];
