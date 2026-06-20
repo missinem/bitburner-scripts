@@ -681,7 +681,7 @@ export async function main(ns) {
       ns.print(`[DNET-CRACK] BigMo constraint ${c.n}: (P%${c.n})%${m}=${c.r}`);
     }
 
-    async function probe(n) {
+    async function sampleMod(n) {
       if (triedProbes.has(n)) return null;
       triedProbes.add(n);
       const raw = await rdRaw(host, String(n));
@@ -701,7 +701,7 @@ export async function main(ns) {
       .filter(n => ((n - 1) % 32) + 1 > 1);
 
     for (const n of probePlan) {
-      const r = await probe(n);
+      const r = await sampleMod(n);
       if (r?.done) return { success: true, password: r.password, model };
       if (constraints.length >= 6) break;
       await ns.sleep(0);
@@ -717,7 +717,7 @@ export async function main(ns) {
 
     for (const n of probePlan) {
       if (candidates.length <= maxTry) break;
-      const r = await probe(n);
+      const r = await sampleMod(n);
       if (r?.done) return { success: true, password: r.password, model };
       candidates = collectBigMoCandidates(lo, hi, passLen, constraints, maxTry + 1);
       ns.print(`[DNET-CRACK] BigMo narrowed to ${candidates.length}`);
@@ -795,14 +795,14 @@ export async function main(ns) {
     // Heartbleed: extract previous altitude attempts and focus near best
     const hb = await rdHeartbleed(host);
     const records = parseKotHHeartbleed(hb.logs ?? [], n)
-      .filter(r => r.attempt >= lo && r.attempt <= hi)
+      .filter(r => r.numericGuess >= lo && r.numericGuess <= hi)
       .sort((a, b) => b.alt - a.alt);
 
     if (records.length) {
       const priority = [];
       for (const rec of records.slice(0, 8)) {
         priority.push(rec.password);
-        priority.push(...neighborStrings(rec.attempt, n, lo, hi, 3));
+        priority.push(...neighborStrings(rec.numericGuess, n, lo, hi, 3));
         if (n <= 6) priority.push(...uniquePermutationsArray(rec.password, 720));
       }
       for (const pw of uniqueStrings(priority)) {
@@ -999,7 +999,7 @@ export async function main(ns) {
       const pw = String(m[2] ?? "").trim();
       if (!Number.isFinite(alt) || !/^\d+$/.test(pw)) continue;
       if (len && pw.length !== len) continue;
-      out.push({ alt, password: pw, attempt: Number(pw) });
+      out.push({ alt, password: pw, numericGuess: Number(pw) });
     }
     return out;
   }
