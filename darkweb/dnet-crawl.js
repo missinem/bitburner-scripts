@@ -90,19 +90,20 @@ export async function main(ns) {
       // Process each neighbor immediately.
       for (const target of neighbors) {
         if (shouldDie()) break;
+        // Skip servers already handled — before any sync API calls to prevent busy-loop.
         if (crackedThisSession.has(target)) continue;
+        if (sentToCracker.has(target)) continue;
 
         // Get details directly — no rd() overhead.
         let det;
         try { det = await ns.dnet.getServerDetails(target); } catch (_) { continue; }
         if (!det || !det.isOnline) continue;
 
-        didAnything = true;
-
         // Active session — spread immediately.
         if (det.hasSession) {
           crackedThisSession.add(target);
           if (!NO_SPREAD) await spreadTo(target, "");
+          didAnything = true;
           continue;
         }
 
@@ -115,26 +116,30 @@ export async function main(ns) {
             ns.print(`[DNET-CRAWL] Reconnected ${target} via ledger`);
             crackedThisSession.add(target);
             if (!NO_SPREAD) await spreadTo(target, pw);
+            didAnything = true;
             continue;
           }
         }
 
         const model = det.modelId ?? det.model ?? "?";
+
+        // Hard models: delegate and mark so we skip on future cycles.
+        if (!isHandledInline(model, det)) {
+          await sendToCracker(target);
+          sentToCracker.add(target);
+          didAnything = true;
+          continue;
+        }
+
+        // Simple model: attempt crack directly. authenticate() provides natural throttle.
         const pw = NO_SIMPLE ? null : await tryCrackSimple(target, det, model);
+        didAnything = true; // we made at least one authenticate() call
 
         if (pw !== null && pw !== undefined) {
-          // authenticate() already confirmed the password; go straight to spread.
           ns.print(`[DNET-CRAWL] [CRACKED] ${target} model=${model} pw="${pw}"`);
           crackedThisSession.add(target);
           await recordPassword(target, pw, model);
           if (!NO_SPREAD) await spreadTo(target, pw);
-          continue;
-        }
-
-        // Delegate hard models (and unhandled simple variants) to dnet-crack.js.
-        if (!sentToCracker.has(target) && !isHandledInline(model, det)) {
-          await sendToCracker(target);
-          sentToCracker.add(target);
         }
       }
 
