@@ -109,38 +109,54 @@ export async function main(ns) {
   }
 
   // ── dnet API wrappers ─────────────────────────────────────────────────────
+  // Each operation has its own hardcoded timeout based on its known max duration:
+  //   probe/getBlockedRam/connectToSession: fast sync calls, 8s safety margin
+  //   openCache: fast, 8s
+  //   phishingAttack: I/O bound, 20s
+  //   memoryReallocation: max(8000*(500/(500+cha)), 200) ms → up to 8s at cha=0;
+  //                        add generous margin → 30s
+  //   unleashStormSeed: async but quick, 15s
+  //   setStasisLink: source says ~30s delay → 60s
+  // RD_TIMEOUT_MS (from --rd-timeout) is kept only as a floor so users can
+  // extend all timeouts at once if they hit exotic slowdowns.
+
+  const T_FAST    = Math.max(RD_TIMEOUT_MS,  8_000);
+  const T_PHISH   = Math.max(RD_TIMEOUT_MS, 20_000);
+  const T_REALLOC = Math.max(RD_TIMEOUT_MS, 30_000);
+  const T_STORM   = Math.max(RD_TIMEOUT_MS, 15_000);
+  const T_STASIS  = Math.max(RD_TIMEOUT_MS, 60_000);
 
   async function rdProbe() {
-    return rd("probe", `ns.dnet.probe()`, []);
+    return rd("probe", `ns.dnet.probe()`, [], T_FAST);
   }
 
   async function rdGetBlockedRam(target) {
-    const r = await rd("blockedram", `(()=>{try{return ns.dnet.getBlockedRam(args[0])}catch(_){try{return ns.dnet.getServerDetails(args[0]).blockedRam}catch(__){return 0}}})()`, [target]);
+    const r = await rd("blockedram", `(()=>{try{return ns.dnet.getBlockedRam(args[0])}catch(_){try{return ns.dnet.getServerDetails(args[0]).blockedRam}catch(__){return 0}}})()`, [target], T_FAST);
     return Number.isFinite(r) ? r : 0;
   }
 
   async function rdMemRealloc(target) {
-    return rd("realloc", `ns.dnet.memoryReallocation(args[0])`, [target], RD_TIMEOUT_MS * 2);
+    return rd("realloc", `ns.dnet.memoryReallocation(args[0])`, [target], T_REALLOC);
   }
 
   async function rdOpenCache(file) {
-    return rd("cache", `ns.dnet.openCache(args[0])`, [file]);
+    return rd("cache", `ns.dnet.openCache(args[0])`, [file], T_FAST);
   }
 
   async function rdPhish() {
-    return rd("phish", `ns.dnet.phishingAttack()`, [], RD_TIMEOUT_MS * 2);
+    return rd("phish", `ns.dnet.phishingAttack()`, [], T_PHISH);
   }
 
   async function rdStorm() {
-    return rd("storm", `ns.dnet.unleashStormSeed()`, []);
+    return rd("storm", `ns.dnet.unleashStormSeed()`, [], T_STORM);
   }
 
   async function rdStasis(link) {
-    return rd("stasis", `ns.dnet.setStasisLink(args[0])`, [link], 45_000);
+    return rd("stasis", `ns.dnet.setStasisLink(args[0])`, [link], T_STASIS);
   }
 
   async function rdConnect(host, pw) {
-    return rd("session", `ns.dnet.connectToSession(args[0],args[1])`, [host, pw]);
+    return rd("session", `ns.dnet.connectToSession(args[0],args[1])`, [host, pw], T_FAST);
   }
 
   // ── Operations ────────────────────────────────────────────────────────────

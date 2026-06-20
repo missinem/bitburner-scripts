@@ -231,17 +231,21 @@ export async function main(ns) {
   }
 
   // ── Low-frequency rd() wrappers (storm / stasis / backdoor) ─────────────────
+  // Hardcoded per-operation timeouts — RD_TIMEOUT_MS acts only as a floor.
+  const T_STORM   = Math.max(RD_TIMEOUT_MS, 15_000);
+  const T_STASIS  = Math.max(RD_TIMEOUT_MS, 60_000);
+  const T_BACKDOOR = Math.max(RD_TIMEOUT_MS, 30_000);
 
   async function rdStorm() {
-    return rd("storm", `ns.dnet.unleashStormSeed()`, []);
+    return rd("storm", `ns.dnet.unleashStormSeed()`, [], T_STORM);
   }
 
   async function rdStasis(link) {
-    return rd("stasis", `ns.dnet.setStasisLink(args[0])`, [link], 45_000);
+    return rd("stasis", `ns.dnet.setStasisLink(args[0])`, [link], T_STASIS);
   }
 
   async function rdBackdoor(target) {
-    return rd("backdoor", `ns.dnet.backdoor(args[0])`, [target], 30_000);
+    return rd("backdoor", `ns.dnet.backdoor(args[0])`, [target], T_BACKDOOR);
   }
 
   // ── Simple inline crackers (direct ns.dnet.authenticate calls) ──────────────
