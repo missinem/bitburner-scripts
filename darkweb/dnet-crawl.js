@@ -58,6 +58,16 @@ export async function main(ns) {
   const crackedThisSession = new Set();
   const sentToCracker      = new Set();
 
+  // Candidate lists — must be declared BEFORE the while loop (TDZ safety).
+  const DEFAULTS     = ["admin", "password", "0000", "12345"];
+  const DOGS         = ["fido", "spot", "rover", "max"];
+  const EU_COUNTRIES = [
+    "Austria", "Belgium", "Bulgaria", "Croatia", "Republic of Cyprus", "Czech Republic",
+    "Denmark", "Estonia", "Finland", "France", "Germany", "Greece", "Hungary", "Ireland",
+    "Italy", "Latvia", "Lithuania", "Luxembourg", "Malta", "Netherlands", "Poland",
+    "Portugal", "Romania", "Slovakia", "Slovenia", "Spain", "Sweden",
+  ];
+
   // Initial maintenance before main loop
   if (!NO_MAINT) {
     try {
@@ -93,6 +103,10 @@ export async function main(ns) {
         // Skip servers already handled — before any sync API calls to prevent busy-loop.
         if (crackedThisSession.has(target)) continue;
         if (sentToCracker.has(target)) continue;
+
+        // Yield to the browser before sync API calls — prevents freeze when
+        // multiple freshly-spread crawlers all do their first pass simultaneously.
+        await ns.sleep(0);
 
         // Get details directly — no rd() overhead.
         let det;
@@ -232,9 +246,6 @@ export async function main(ns) {
 
   // ── Simple inline crackers (direct ns.dnet.authenticate calls) ──────────────
 
-  const DEFAULTS = ["admin","password","0000","12345"];
-  const DOGS     = ["fido","spot","rover","max"];
-
   // Returns true when the model is fully handled inline for ALL difficulty ranges.
   // BellaCuore/RomanNumeral at diff>=8 fall through to dnet-crack.js.
   function isHandledInline(model, det) {
@@ -245,6 +256,8 @@ export async function main(ns) {
       case "CloudBlare(tm)": case "Captcha":
       case "Laika4": case "DogNames":
       case "Pr0verFl0": case "BufferOverflow":
+        return true;
+      case "EuroZone Free": case "EUCountryDictionary":
         return true;
       case "BellaCuore": case "RomanNumeral":
         return (det.difficulty ?? 99) < 8;
@@ -276,6 +289,9 @@ export async function main(ns) {
 
       case "Pr0verFl0": case "BufferOverflow":
         return await crackBufferOverflow(target, det);
+
+      case "EuroZone Free": case "EUCountryDictionary":
+        return await tryCandidates(target, EU_COUNTRIES);
 
       default:
         return null;
