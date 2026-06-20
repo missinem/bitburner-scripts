@@ -39,6 +39,7 @@ export async function main(ns) {
   const NO_MAINT      = hasArg(ns, "--no-maint");
   const NO_SPREAD     = hasArg(ns, "--no-spread");
   const NO_SIMPLE     = hasArg(ns, "--no-simple");
+  const NO_PHISH      = hasArg(ns, "--no-phish");
   const COPY_HOME     = hasArg(ns, "--copy-home") || HOST !== HOME;
   const DOCTOR        = hasArg(ns, "--doctor");
 
@@ -68,11 +69,19 @@ export async function main(ns) {
     "Portugal", "Romania", "Slovakia", "Slovenia", "Spain", "Sweden",
   ];
 
+  // Build ops flag list once — phish only runs on real darknet servers.
+  const opsFlags = () => {
+    const f = ["--realloc", "--open-caches"];
+    if (!NO_PHISH && HOST !== HOME && HOST !== "darkweb") f.push("--phish");
+    return f;
+  };
+
   // Initial maintenance before main loop
   if (!NO_MAINT) {
     try {
-      const pid = ns.exec(OPS, HOST, { preventDuplicates: true }, "--realloc", "--open-caches");
-      if (pid) ns.print(`[DNET-CRAWL] Launched ${OPS} --realloc --open-caches pid=${pid}`);
+      const flags = opsFlags();
+      const pid = ns.exec(OPS, HOST, { preventDuplicates: true }, ...flags);
+      if (pid) ns.print(`[DNET-CRAWL] Launched ${OPS} ${flags.join(" ")} pid=${pid}`);
     } catch (_) {}
     lastMaint = Date.now();
   }
@@ -163,11 +172,21 @@ export async function main(ns) {
         try { await ns.scp(MAP_FILE, HOME, HOST); } catch (_) {}
       }
 
-      // Periodic maintenance
+      // Eager cache scan — open any .cache files immediately without waiting for
+      // the full maint interval. Runs even when NO_MAINT is set so caches are
+      // never left sitting. Uses preventDuplicates so no double-launch.
+      try {
+        if (ns.ls(HOST, ".cache").length > 0) {
+          ns.exec(OPS, HOST, { preventDuplicates: true }, "--open-caches");
+        }
+      } catch (_) {}
+
+      // Periodic full maintenance (realloc + open-caches + phish)
       if (!NO_MAINT && Date.now() - lastMaint >= MAINT_MS) {
         try {
-          const pid = ns.exec(OPS, HOST, { preventDuplicates: true }, "--realloc", "--open-caches");
-          if (pid) ns.print(`[DNET-CRAWL] Maintenance ${OPS} pid=${pid}`);
+          const flags = opsFlags();
+          const pid = ns.exec(OPS, HOST, { preventDuplicates: true }, ...flags);
+          if (pid) ns.print(`[DNET-CRAWL] Maintenance ${OPS} ${flags.join(" ")} pid=${pid}`);
         } catch (_) {}
         lastMaint = Date.now();
       }
@@ -320,10 +339,18 @@ export async function main(ns) {
   }
 
   async function crackEcho(target, det) {
-    const raw = String(det.data ?? det.passwordHint ?? "");
-    const nums = raw.replace(/[^0-9]/g, "");
-    if (!nums) return null;
-    return await tryPw(target, nums);
+    const hint = String(det.passwordHint ?? "");
+    const data = String(det.data ?? "");
+    const len  = Number(det.passwordLength ?? 0);
+    const candidates = new Set();
+    // All discrete numbers from hint and data
+    for (const n of extractNumbers(hint)) candidates.add(n);
+    for (const n of extractNumbers(data))  candidates.add(n);
+    // Last N chars of hint/data as a fallback
+    if (len > 0) { candidates.add(hint.slice(-len)); candidates.add(data.slice(-len)); }
+    // Only try pure-digit strings that match the expected length
+    const valid = [...candidates].filter(c => /^\d+$/.test(c) && (!len || c.length === len));
+    return await tryCandidates(target, valid);
   }
 
   async function crackCaptcha(target, det) {
@@ -345,6 +372,10 @@ export async function main(ns) {
   async function crackBufferOverflow(target, det) {
     const passLen = det.passwordLength ?? 4;
     return await tryPw(target, "A".repeat(passLen * 2));
+  }
+
+  function extractNumbers(str) {
+    return [...String(str).matchAll(/\b(\d+)\b/g)].map(m => m[1]);
   }
 
   function parseRoman(s) {
@@ -562,7 +593,7 @@ function getFlagNumber(ns, names, fallback = 0) {
 export function autocomplete() {
   return [
     "--tail", "--idle-ms", "--loop", "--maint-ms", "--rd-timeout", "--max-spread",
-    "--no-maint", "--no-spread", "--no-simple", "--copy-home",
+    "--no-maint", "--no-spread", "--no-simple", "--no-phish", "--copy-home",
     "--kill-port", "--cmd-port", "--keep-rd", "--doctor",
   ];
 }
