@@ -167,8 +167,7 @@ export async function main(ns) {
         if (shouldDie()) return;
         const result = await rdMemRealloc(target);
         const done = result?.done === true;
-        const freed = result?.ram ?? result?.recoveredRam ?? result?.freedRam ?? "?";
-        ns.print(`[DNET-OPS] memoryReallocation(${target}) #${i + 1} done=${done} freed=${freed}`);
+        ns.print(`[DNET-OPS] memoryReallocation(${target}) #${i + 1} done=${done} result=${JSON.stringify(result)}`);
         await openLocalCaches();
         if (done) break;
 

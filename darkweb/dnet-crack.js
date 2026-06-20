@@ -1045,7 +1045,9 @@ export async function main(ns) {
   }
 
   async function spread(host, password) {
-    try { await rdConnect(host, password); } catch (_) {}
+    // Must call connectToSession directly (not via rd()) so session is registered
+    // under this script's PID, not a temp script's PID that exits immediately.
+    try { await ns.dnet.connectToSession(host, String(password ?? "")); } catch (_) {}
 
     const files = [CRAWL, CRACK, OPS, SCRAPE, ROUTE, LAB, LEDGER, MAP]
       .filter(f => ns.fileExists(f, HOST));

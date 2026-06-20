@@ -96,7 +96,7 @@ export async function main(ns) {
       // Already have a session — just spread if not yet done
       if (det.hasSession) {
         crackedThisSession.add(target);
-        if (!NO_SPREAD) await spreadTo(target);
+        if (!NO_SPREAD) await spreadTo(target, "");
         continue;
       }
 
@@ -108,7 +108,7 @@ export async function main(ns) {
         if (ok?.success || ok?.session) {
           ns.print(`[DNET-CRAWL] Reconnected ${target} via ledger`);
           crackedThisSession.add(target);
-          if (!NO_SPREAD) await spreadTo(target);
+          if (!NO_SPREAD) await spreadTo(target, rec.password);
           continue;
         }
       }
@@ -124,7 +124,7 @@ export async function main(ns) {
           ns.print(`[DNET-CRAWL] [CRACKED] ${target} model=${model} pw="${pw}"`);
           crackedThisSession.add(target);
           await recordPassword(target, pw, model);
-          if (!NO_SPREAD) await spreadTo(target);
+          if (!NO_SPREAD) await spreadTo(target, pw);
           continue;
         }
       }
@@ -420,9 +420,16 @@ export async function main(ns) {
 
   // ── Spreading ───────────────────────────────────────────────────────────────
 
-  async function spreadTo(target) {
+  async function spreadTo(target, pw) {
     if (NO_SPREAD || spreadCount >= MAX_SPREAD) return;
     if (target === HOST || target === HOME) return;
+
+    // Establish session from THIS script's PID so scp/exec succeed.
+    // connectToSession is called directly (not via rd()) so the session is
+    // registered under our PID, not a temp script's PID.
+    if (pw !== undefined && pw !== null) {
+      try { await ns.dnet.connectToSession(target, String(pw)); } catch (_) {}
+    }
 
     // Files to copy
     const files = [
