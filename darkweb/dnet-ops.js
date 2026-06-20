@@ -89,7 +89,7 @@ export async function main(ns) {
     }
 
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && ns.isRunning(pid)) await ns.sleep(50);
+    while (Date.now() < deadline && ns.isRunning(pid)) await ns.sleep(10);
     if (ns.isRunning(pid)) {
       try { ns.kill(pid); } catch (_) {}
       if (!KEEP_RD) { try { ns.rm(sf, HOST); } catch (_) {} try { ns.rm(of, HOST); } catch (_) {} }

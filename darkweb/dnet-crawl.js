@@ -67,91 +67,95 @@ export async function main(ns) {
 
   // Main loop
   while (true) {
-    if (shouldDie()) {
-      ns.print(`[DNET-CRAWL] Kill signal received on port ${KILL_PORT}. Exiting.`);
-      return;
-    }
+    try {
+      if (shouldDie()) {
+        ns.print(`[DNET-CRAWL] Kill signal received on port ${KILL_PORT}. Exiting.`);
+        return;
+      }
 
-    await handleCommandBus();
+      await handleCommandBus();
 
-    // Probe neighbors
-    const neighbors = await rd("probe", `ns.dnet.probe()`, []) ?? [];
-    if (neighbors.length === 0) {
-      ns.print(`[DNET-CRAWL] No neighbors found; sleeping ${LOOP_MS}ms`);
-      await ns.sleep(LOOP_MS);
-      continue;
-    }
-
-    // Batch-fetch server details
-    const detailsMap = await batchDetails(neighbors);
-
-    // Process each neighbor
-    for (const target of neighbors) {
-      if (shouldDie()) break;
-      if (crackedThisSession.has(target)) continue;
-
-      const det = detailsMap[target];
-      if (!det) continue;
-
-      // Already have a session — just spread if not yet done
-      if (det.hasSession) {
-        crackedThisSession.add(target);
-        if (!NO_SPREAD) await spreadTo(target, "");
+      // Probe neighbors
+      const neighbors = await rd("probe", `ns.dnet.probe()`, []) ?? [];
+      if (neighbors.length === 0) {
+        ns.print(`[DNET-CRAWL] No neighbors found; sleeping ${LOOP_MS}ms`);
+        await ns.sleep(LOOP_MS);
         continue;
       }
 
-      // Check ledger first — reconnect if we know the password
-      const ledger = readLedger();
-      const rec = ledger.get(target);
-      if (rec?.password !== undefined) {
-        const ok = await rdConnect(target, rec.password);
-        if (ok?.success || ok?.session) {
-          ns.print(`[DNET-CRAWL] Reconnected ${target} via ledger`);
+      // Batch-fetch server details
+      const detailsMap = await batchDetails(neighbors);
+
+      // Process each neighbor
+      for (const target of neighbors) {
+        if (shouldDie()) break;
+        if (crackedThisSession.has(target)) continue;
+
+        const det = detailsMap[target];
+        if (!det) continue;
+
+        // Already have a session — just spread if not yet done
+        if (det.hasSession) {
           crackedThisSession.add(target);
-          if (!NO_SPREAD) await spreadTo(target, rec.password);
+          if (!NO_SPREAD) await spreadTo(target, "");
           continue;
         }
-      }
 
-      if (failedThisSession.has(target)) continue;
+        // Check ledger first — reconnect if we know the password
+        const ledger = readLedger();
+        const rec = ledger.get(target);
+        if (rec?.password !== undefined) {
+          const ok = await rdConnect(target, rec.password);
+          if (ok?.success || ok?.session) {
+            ns.print(`[DNET-CRAWL] Reconnected ${target} via ledger`);
+            crackedThisSession.add(target);
+            if (!NO_SPREAD) await spreadTo(target, rec.password);
+            continue;
+          }
+        }
 
-      const model = det.modelId ?? det.model ?? "?";
-      const pw = NO_SIMPLE ? null : await tryCrackSimple(target, det, model);
+        if (failedThisSession.has(target)) continue;
 
-      if (pw !== null && pw !== undefined) {
-        const session = await rdConnect(target, pw);
-        if (session?.success || session?.session) {
-          ns.print(`[DNET-CRAWL] [CRACKED] ${target} model=${model} pw="${pw}"`);
-          crackedThisSession.add(target);
-          await recordPassword(target, pw, model);
-          if (!NO_SPREAD) await spreadTo(target, pw);
-          continue;
+        const model = det.modelId ?? det.model ?? "?";
+        const pw = NO_SIMPLE ? null : await tryCrackSimple(target, det, model);
+
+        if (pw !== null && pw !== undefined) {
+          const session = await rdConnect(target, pw);
+          if (session?.success || session?.session) {
+            ns.print(`[DNET-CRAWL] [CRACKED] ${target} model=${model} pw="${pw}"`);
+            crackedThisSession.add(target);
+            await recordPassword(target, pw, model);
+            if (!NO_SPREAD) await spreadTo(target, pw);
+            continue;
+          }
+        }
+
+        // Delegate to dnet-crack.js for hard models
+        if (!sentToCracker.has(target)) {
+          const modelId = det.modelId ?? "";
+          if (!isSimpleModel(modelId)) {
+            await sendToCracker(target);
+            sentToCracker.add(target);
+          }
         }
       }
 
-      // Delegate to dnet-crack.js for hard models
-      if (!sentToCracker.has(target)) {
-        const modelId = det.modelId ?? "";
-        if (!isSimpleModel(modelId)) {
-          await sendToCracker(target);
-          sentToCracker.add(target);
-        }
+      // Record topology
+      updateMap(neighbors, detailsMap);
+      if (COPY_HOME && HOST !== HOME) {
+        try { await ns.scp(MAP_FILE, HOME, HOST); } catch (_) {}
       }
-    }
 
-    // Record topology
-    updateMap(neighbors, detailsMap);
-    if (COPY_HOME && HOST !== HOME) {
-      try { await ns.scp(MAP_FILE, HOME, HOST); } catch (_) {}
-    }
-
-    // Periodic maintenance
-    if (!NO_MAINT && Date.now() - lastMaint >= MAINT_MS) {
-      try {
-        const pid = ns.exec(OPS, HOST, { preventDuplicates: true }, "--realloc", "--open-caches");
-        if (pid) ns.print(`[DNET-CRAWL] Maintenance ${OPS} pid=${pid}`);
-      } catch (_) {}
-      lastMaint = Date.now();
+      // Periodic maintenance
+      if (!NO_MAINT && Date.now() - lastMaint >= MAINT_MS) {
+        try {
+          const pid = ns.exec(OPS, HOST, { preventDuplicates: true }, "--realloc", "--open-caches");
+          if (pid) ns.print(`[DNET-CRAWL] Maintenance ${OPS} pid=${pid}`);
+        } catch (_) {}
+        lastMaint = Date.now();
+      }
+    } catch (e) {
+      ns.print(`[DNET-CRAWL] Loop error (will retry): ${e}`);
     }
 
     await ns.sleep(LOOP_MS);
@@ -189,7 +193,7 @@ export async function main(ns) {
     }
 
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && ns.isRunning(pid)) await ns.sleep(50);
+    while (Date.now() < deadline && ns.isRunning(pid)) await ns.sleep(10);
     if (ns.isRunning(pid)) {
       try { ns.kill(pid); } catch (_) {}
       if (!KEEP_RD) { try { ns.rm(sf, HOST); } catch (_) {} try { ns.rm(of, HOST); } catch (_) {} }
