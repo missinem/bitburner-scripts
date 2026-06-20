@@ -1,6 +1,8 @@
 // /darkweb/dnet-ctl.js — darknet control plane
 // Combines dnet-kill.js + dnet-port.js with status command added.
-// No ns.dnet.* calls; RAM budget: ~1 GB.
+// For stormseed/stasis/backdoor with a target, directly execs dnet-ops.js on the
+// target server (no crawl agent required). Falls back to port broadcast if exec fails.
+// RAM budget: ~2.5 GB (ns.exec + ns.dnet.connectToSession added for direct exec).
 //
 // Usage:
 //   run /darkweb/dnet-ctl.js --kill [--restart]
@@ -17,6 +19,8 @@ export async function main(ns) {
   const SELF = ns.getScriptName();
   const DIR = dirname(SELF);
   const CRAWL = DIR ? `${DIR}/dnet-crawl.js` : "dnet-crawl.js";
+  const OPS   = DIR ? `${DIR}/dnet-ops.js`   : "dnet-ops.js";
+  const LEDGER = "/darkweb/dnet-passwords.txt";
 
   const KILL_PORT = getFlagNumber(ns, ["--kill-port"], 20);
   const CMD_PORT = getFlagNumber(ns, ["--cmd-port"], 21);
@@ -89,6 +93,29 @@ export async function main(ns) {
     return;
   }
 
+  // ── Direct exec (stormseed / stasis / unstasis / backdoor with a specific target) ──
+  // More reliable than the port bus because it doesn't require a crawl agent to be
+  // running on the target server.
+  if (parsed.target && ["stormseed", "stasis", "unstasis"].includes(parsed.action)) {
+    const ledger = readLedger(ns, LEDGER);
+    const rec = ledger.get(parsed.target);
+    if (rec !== undefined) {
+      try { await ns.dnet.connectToSession(parsed.target, rec.password ?? ""); } catch (_) {}
+    }
+    const opsArg = parsed.action === "stormseed" ? "--stormseed"
+                 : parsed.action === "stasis"    ? "--stasis"
+                 :                                 "--stasis false";
+    const pid = opsArg === "--stasis false"
+      ? ns.exec(OPS, parsed.target, 1, "--stasis", "false")
+      : ns.exec(OPS, parsed.target, 1, opsArg);
+    if (pid > 0) {
+      ns.tprint(`[DNET-CTL] Launched dnet-ops.js ${opsArg} on ${parsed.target} pid=${pid}`);
+      return;
+    }
+    ns.tprint(`[DNET-CTL] Direct exec failed on ${parsed.target} (no session?); broadcasting via port ${CMD_PORT}`);
+  }
+
+  // ── Port broadcast (broadcast to all agents, or fallback when direct exec fails) ──
   const id = `${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
   const expiresAt = Date.now() + Math.max(1_000, TTL_MS);
   const signal = `${CMD_PREFIX}${id}|${expiresAt}|${parsed.action}|${encodeURIComponent(parsed.target || "")}`;
@@ -127,6 +154,19 @@ function parseActionAndTarget(ns) {
     }
   }
   return { action: "", target: "" };
+}
+
+function readLedger(ns, ledgerPath) {
+  const out = new Map();
+  try {
+    const raw = String(ns.read(ledgerPath) || "");
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const [host, password = ""] = line.split("|");
+      if (host) out.set(host, { password });
+    }
+  } catch (_) {}
+  return out;
 }
 
 function clearPort(ns, port) {

@@ -58,6 +58,7 @@ export async function main(ns) {
   let spreadCount = 0;
   const crackedThisSession = new Set();
   const sentToCracker      = new Set();
+  const handledCmdIds      = new Set(); // prevents re-executing same command each loop cycle
 
   // Candidate lists — must be declared BEFORE the while loop (TDZ safety).
   const DEFAULTS     = ["admin", "password", "0000", "12345"];
@@ -399,19 +400,25 @@ export async function main(ns) {
     const [id, expiresAtStr, action, encodedTarget = ""] = rest.split("|");
     const expiresAt = Number(expiresAtStr ?? 0);
     if (Date.now() > expiresAt) return;
+    if (handledCmdIds.has(id)) return; // already acted on this command this session
 
     const target = decodeURIComponent(encodedTarget);
-    ns.print(`[DNET-CRAWL] CMD id=${id} action=${action} target="${target}"`);
 
     switch (action) {
       case "stormseed": {
+        // Only execute if: no specific target (broadcast), or target matches this server.
+        if (target && target !== HOST) break;
         if (!ns.fileExists("STORM_SEED.exe", HOST)) break;
+        handledCmdIds.add(id);
+        ns.print(`[DNET-CRAWL] CMD stormseed on ${HOST}`);
         const r = await rdStorm();
         ns.tprint(`[DNET-CRAWL] STORM_SEED unleashed: ${JSON.stringify(r)}`);
         break;
       }
       case "stasis": {
         if (!target || target === HOST) {
+          handledCmdIds.add(id);
+          ns.print(`[DNET-CRAWL] CMD stasis(true) on ${HOST}`);
           const r = await rdStasis(true);
           ns.print(`[DNET-CRAWL] stasis(true): ${JSON.stringify(r)}`);
         }
@@ -419,6 +426,8 @@ export async function main(ns) {
       }
       case "unstasis": {
         if (!target || target === HOST) {
+          handledCmdIds.add(id);
+          ns.print(`[DNET-CRAWL] CMD stasis(false) on ${HOST}`);
           const r = await rdStasis(false);
           ns.print(`[DNET-CRAWL] stasis(false): ${JSON.stringify(r)}`);
         }
@@ -426,11 +435,15 @@ export async function main(ns) {
       }
       case "backdoor": {
         if (!target || target === HOST) break;
+        handledCmdIds.add(id);
+        ns.print(`[DNET-CRAWL] CMD backdoor ${target} from ${HOST}`);
         const r = await rdBackdoor(target);
         ns.print(`[DNET-CRAWL] backdoor(${target}): ${JSON.stringify(r)}`);
         break;
       }
       case "backdoor-all": {
+        handledCmdIds.add(id);
+        ns.print(`[DNET-CRAWL] CMD backdoor-all from ${HOST}`);
         let nbrs = [];
         try { nbrs = await ns.dnet.probe() ?? []; } catch (_) {}
         for (const h of nbrs) {
